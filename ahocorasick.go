@@ -18,7 +18,9 @@ type Builder struct {
 	check      []int
 	suffixLink []int
 	values     []interface{}
-	used       []bool
+
+	entries   []*entryState
+	headEntry *entryState
 }
 
 // Searcher is an interface to search over AC.
@@ -27,6 +29,45 @@ type Searcher struct {
 	check      []int
 	suffixLink []int
 	values     []interface{}
+}
+
+type entryState struct {
+	used  bool
+	index int
+	next  *entryState
+	prev  *entryState
+}
+
+func newEntryState() *entryState {
+	var es entryState
+	es.init()
+	return &es
+}
+
+func (es *entryState) init() {
+	es.used = false
+	es.index = -1
+	es.next = es
+	es.prev = es
+}
+
+func (es *entryState) unlink() {
+	es.next.prev = es.prev
+	es.prev.next = es.next
+}
+
+func (es *entryState) linkAsNext(other *entryState) {
+	other.next = es.next
+	other.prev = es
+	es.next.prev = other
+	es.next = other
+}
+
+func (es *entryState) linkAsPrev(other *entryState) {
+	other.prev = es.prev
+	other.next = es
+	es.prev.next = other
+	es.prev = other
 }
 
 type wordSorter struct {
@@ -49,7 +90,7 @@ func (ws *wordSorter) Swap(i, j int) {
 
 // NewBuilder creates a new AC builder
 func NewBuilder() *Builder {
-	return &Builder{}
+	return &Builder{headEntry: newEntryState()}
 }
 
 // Add inserts candidate words
@@ -73,11 +114,16 @@ func (b *Builder) Build() *Searcher {
 }
 
 func (b *Builder) extendBlocks() {
+	start := len(b.base)
 	for i := 0; i < blockSize; i++ {
 		b.base = append(b.base, 0)
 		b.check = append(b.check, -1)
 		b.suffixLink = append(b.suffixLink, 0)
-		b.used = append(b.used, false)
+
+		es := newEntryState()
+		es.index = start + i
+		b.entries = append(b.entries, es)
+		b.headEntry.linkAsPrev(es)
 	}
 }
 
@@ -193,18 +239,21 @@ func (b *Builder) getCharacter(i, j int) byte {
 }
 
 func (b *Builder) findNextPosition(labels []byte) int {
-	impl := func(begin, end int) int {
-		if len(labels) > 0 {
-			end -= int(labels[len(labels)-1])
-		}
-		for i := begin; i < end; i++ {
-			if b.used[i] {
-				continue
+	impl := func(startEntry, endEntry *entryState) int {
+		for es := startEntry; es != endEntry; es = es.next {
+			if es.used || es.index < 0 {
+				panic("invalid entry but in links")
 			}
+			i := es.index
+			// check length
+			if i+int(labels[len(labels)-1]) >= len(b.entries) {
+				break
+			}
+			// match all the labels
 			ok := true
 			for _, l := range labels {
 				nc := i + int(l)
-				if b.used[nc] {
+				if b.entries[nc].used {
 					ok = false
 					break
 				}
@@ -216,25 +265,34 @@ func (b *Builder) findNextPosition(labels []byte) int {
 		return -1
 	}
 
-	begin := 0
-	firstRun := true
-	for {
-		end := len(b.base)
-		if p := impl(begin, end); p >= 0 {
-			b.used[p] = true
-			for _, l := range labels {
-				nc := p + int(l)
-				b.used[nc] = true
-			}
-			return p
+	p := -1
+	startEntry := b.headEntry.next
+	lastEntry := b.headEntry.prev
+	for i := 0; ; i++ {
+		p = impl(startEntry, b.headEntry)
+		if p >= 0 {
+			break
 		}
-		if !firstRun {
-			panic("fail to find next position")
+		if p < 0 && i >= 1 {
+			panic("cannot find next pos?")
 		}
-		firstRun = false
+
+		atLeastIndex := len(b.base) - int(labels[len(labels)-1])
 		b.extendBlocks()
-		begin = end - blockSize
+		for lastEntry != b.headEntry && lastEntry.index >= atLeastIndex {
+			lastEntry = lastEntry.prev
+		}
+		startEntry = lastEntry.next
 	}
+
+	for _, l := range labels {
+		nc := p + int(l)
+		b.entries[nc].used = true
+		b.entries[nc].unlink()
+	}
+	b.entries[p].used = true
+	b.entries[p].unlink()
+	return p
 }
 
 func (s *Searcher) prefixSearch(word string) (int, bool) {
